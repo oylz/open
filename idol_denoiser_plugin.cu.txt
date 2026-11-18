@@ -1,0 +1,1625 @@
+#include "idol_denoiser_plugin.h"
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <cudnn.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+#include <sys/time.h>
+
+// Enable after: git clone https://github.com/NVIDIA/cudnn-frontend.git
+// and -I<path>/include  (header-only for most builds)
+// #define IDOL_USE_CUDNN_FRONTEND 1
+#if defined(IDOL_USE_CUDNN_FRONTEND)
+#include <cudnn_frontend.h>
+#endif
+
+using namespace nvinfer1;
+
+static uint64_t gtm() {
+    struct timeval tm;
+    gettimeofday(&tm, 0);
+    return ((uint64_t)tm.tv_sec) * 1000000ULL + tm.tv_usec;
+}
+
+// ============================================================
+// A. Creator
+// ============================================================
+idol_denoiser_plugin_creator::idol_denoiser_plugin_creator() {
+    mFC.nbFields = 0;
+    mFC.fields = nullptr;
+}
+const char* idol_denoiser_plugin_creator::getPluginName() const noexcept { return "IdolDenoiser"; }
+const char* idol_denoiser_plugin_creator::getPluginVersion() const noexcept { return "1"; }
+const PluginFieldCollection* idol_denoiser_plugin_creator::getFieldNames() noexcept { return &mFC; }
+IPluginV2* idol_denoiser_plugin_creator::createPlugin(const char*, const PluginFieldCollection*) noexcept {
+    return new idol_denoiser_plugin();
+}
+IPluginV2* idol_denoiser_plugin_creator::deserializePlugin(const char*, const void* data, size_t len) noexcept {
+    return new idol_denoiser_plugin(data, len);
+}
+void idol_denoiser_plugin_creator::setPluginNamespace(const char* ns) noexcept { mNamespace = ns ? ns : ""; }
+const char* idol_denoiser_plugin_creator::getPluginNamespace() const noexcept { return mNamespace.c_str(); }
+
+REGISTER_TENSORRT_PLUGIN(idol_denoiser_plugin_creator);
+
+// ============================================================
+// B. CUDA Kernels
+// ============================================================
+namespace idol_kernel {
+
+#define CUDA_CHECK_BOOL(x) do { \
+    cudaError_t _e = (x); \
+    if (_e != cudaSuccess) { \
+        fprintf(stderr, "\033[41m[IdolDenoiser] CUDA error: %s @%s:%d\033[0m\n", cudaGetErrorString(_e), __FILE__, __LINE__); \
+        return false; \
+    } \
+} while (0)
+
+static inline int blocks(int n, int threads = 256) {
+    return (n + threads - 1) / threads;
+}
+
+struct DeviceArena {
+    std::vector<void*> ptrs;
+    ~DeviceArena() { release(); }
+    void release() {
+        for (void* p : ptrs) if (p) cudaFree(p);
+        ptrs.clear();
+    }
+    template<class T>
+    bool alloc(size_t n, T** p) {
+        if (n == 0) { *p = nullptr; return true; }
+        cudaError_t e = cudaMalloc((void**)p, n * sizeof(T));
+        if (e != cudaSuccess) return false;
+        ptrs.push_back(*p);
+        return true;
+    }
+};
+
+// 1. Elementwise & Activation Kernels
+__global__ void kFloatToHalf(const float* __restrict__ x, __half* __restrict__ y, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < N) {
+        float4 v = *reinterpret_cast<const float4*>(x + i);
+        y[i+0] = __float2half(v.x);
+        y[i+1] = __float2half(v.y);
+        y[i+2] = __float2half(v.z);
+        y[i+3] = __float2half(v.w);
+    } else {
+        for (int j = 0; j < 4 && i + j < N; ++j) y[i+j] = __float2half(x[i+j]);
+    }
+}
+__global__ void kHalfToFloat(const __half* __restrict__ x, float* __restrict__ y, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < N) {
+        float4 v;
+        v.x = __half2float(x[i+0]);
+        v.y = __half2float(x[i+1]);
+        v.z = __half2float(x[i+2]);
+        v.w = __half2float(x[i+3]);
+        *reinterpret_cast<float4*>(y + i) = v;
+    } else {
+        for (int j = 0; j < 4 && i + j < N; ++j) y[i+j] = __half2float(x[i+j]);
+    }
+}
+// launch helper: threads cover N/4
+static inline int cast_blocks(int N, int threads = 256) {
+    int n = (N + 3) / 4;
+    return (n + threads - 1) / threads;
+}
+
+__global__ void kAdd(const float* a, const float* b, float* y, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) y[i] = a[i] + b[i];
+}
+
+// b is [1, L, C], a is [B, L, C]
+__global__ void kAddBroadcastB(const float* a, const float* b, float* y, int B, int L, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * L * C;
+    if (idx >= total) return;
+    int rem = idx % (L * C);
+    y[idx] = a[idx] + b[rem];
+}
+
+__global__ void kBias(float* y, const float* b, int rows, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * C;
+    if (idx >= total) return;
+    y[idx] += b[idx % C];
+}
+__global__ void kBiasHalf(__half* y, const float* b, int rows, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * C;
+    if (idx >= total) return;
+    y[idx] = __float2half(__half2float(y[idx]) + b[idx % C]);
+}
+__global__ void kAddHalf(const __half* a, const __half* b, __half* y, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) y[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+}
+__global__ void kGELUTanhHalf(const __half* __restrict__ x, __half* __restrict__ y, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    const float kBeta = 0.7978845608028654f;
+    const float kKappa = 0.044715f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        int idx = i + j;
+        if (idx < N) {
+            float v = __half2float(x[idx]);
+            float inner = kBeta * (v + kKappa * v * v * v);
+            y[idx] = __float2half(0.5f * v * (1.0f + tanhf(inner)));
+        }
+    }
+}
+__global__ void kGateResidualAddHalf(
+    __half* x, const __half* h,
+    const float* mod_full, const float* shift_tbl,
+    int B, int L, int C, int gate_chunk_idx
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * L * C;
+    if (idx >= total) return;
+    int c = idx % C;
+    int b = idx / (L * C);
+    float gate = mod_full[(size_t)b * 6 * C + gate_chunk_idx * C + c]
+               + shift_tbl[gate_chunk_idx * C + c];
+    x[idx] = __float2half(__half2float(x[idx]) + __half2float(h[idx]) * gate);
+}
+
+__global__ void kSiLU(const float* x, float* y, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float v = x[i];
+        y[i] = v / (1.0f + expf(-v));
+    }
+}
+
+__global__ void kSiLUMul(const float* gate, const float* content, float* y, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float g = gate[i];
+        float s = g / (1.0f + expf(-g));
+        y[i] = s * content[i];
+    }
+}
+
+// PyTorch nn.GELU(approximate="tanh")
+__global__ void kGELUTanh(const float* x, float* y, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float v = x[i];
+        const float kBeta = 0.7978845608028654f; // sqrt(2 / pi)
+        const float kKappa = 0.044715f;
+        float inner = kBeta * (v + kKappa * v * v * v);
+        y[i] = 0.5f * v * (1.0f + tanhf(inner));
+    }
+}
+
+// 2. Sinusoidal Timestep Embedding
+__global__ void kSinusoidalTimestep(const float* t, float* out, int B, int freq_dim, float max_period) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = freq_dim / 2;
+    if (idx >= B * half) return;
+    int b = idx / half;
+    int i = idx % half;
+    float freq = expf(-logf(max_period) * (float)i / (float)half);
+    float arg = t[b] * freq;
+    out[b * freq_dim + i] = cosf(arg);
+    out[b * freq_dim + half + i] = sinf(arg);
+}
+
+// 3. LayerNorm (with optional weight/bias, and optional adaLN modulation)
+// Safe scalar LayerNorm (1 thread per row) — stable, no hang
+__global__ void kLayerNorm32(
+    const float* x,
+    float* y,
+    const float* gamma,
+    const float* beta,
+    int rows,
+    int C,
+    float eps
+) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* src = x + (size_t)r * C;
+    float* dst = y + (size_t)r * C;
+
+    float mean = 0.0f;
+    for (int c = 0; c < C; ++c) mean += src[c];
+    mean /= (float)C;
+
+    float var = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        float d = src[c] - mean;
+        var += d * d;
+    }
+    var /= (float)C;
+    float inv = rsqrtf(var + eps);
+
+    for (int c = 0; c < C; ++c) {
+        float v = (src[c] - mean) * inv;
+        if (gamma) v = v * gamma[c] + beta[c];
+        dst[c] = v;
+    }
+}
+
+__global__ void kLayerNormModulate(
+    const float* x,
+    const float* mod_full,
+    const float* shift_tbl,
+    float* y,
+    int B, int L, int C,
+    int shift_chunk_idx,
+    int scale_chunk_idx,
+    float eps
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= B * L) return;
+    int b = row / L;
+
+    const float* src = x + (size_t)row * C;
+    float* dst = y + (size_t)row * C;
+
+    float mean = 0.0f;
+    for (int c = 0; c < C; ++c) mean += src[c];
+    mean /= (float)C;
+
+    float var = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        float d = src[c] - mean;
+        var += d * d;
+    }
+    var /= (float)C;
+    float inv = rsqrtf(var + eps);
+
+    const float* mod_b = mod_full + (size_t)b * 6 * C;
+    const float* shift_ptr = mod_b + shift_chunk_idx * C;
+    const float* scale_ptr = mod_b + scale_chunk_idx * C;
+    const float* tbl_shift = shift_tbl + shift_chunk_idx * C;
+    const float* tbl_scale = shift_tbl + scale_chunk_idx * C;
+
+    for (int c = 0; c < C; ++c) {
+        float sft = shift_ptr[c] + tbl_shift[c];
+        float scl = scale_ptr[c] + tbl_scale[c];
+        dst[c] = ((src[c] - mean) * inv) * (1.0f + scl) + sft;
+    }
+}
+
+// Fused residual gate add: x = x + h * (gate[b] + tbl_gate)
+__global__ void kGateResidualAdd(
+    float* x,               // [B, L, C]
+    const float* h,         // [B, L, C]
+    const float* mod_full,  // [B, 6 * C]
+    const float* shift_tbl, // [1, 6 * C]
+    int B, int L, int C,
+    int gate_chunk_idx
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * L * C;
+    if (idx >= total) return;
+    int c = idx % C;
+    int b = idx / (L * C);
+    float gate = mod_full[(size_t)b * 6 * C + gate_chunk_idx * C + c] + shift_tbl[gate_chunk_idx * C + c];
+    x[idx] += h[idx] * gate;
+}
+
+
+// Half I/O LayerNorm, float accumulate (reduce NaN risk vs pure half math)
+__global__ void kLayerNorm32Half(
+    const __half* x, __half* y,
+    const float* gamma, const float* beta,
+    int rows, int C, float eps)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const __half* src = x + (size_t)r * C;
+    __half* dst = y + (size_t)r * C;
+    float mean = 0.f;
+    for (int c = 0; c < C; ++c) mean += __half2float(src[c]);
+    mean /= (float)C;
+    float var = 0.f;
+    for (int c = 0; c < C; ++c) {
+        float d = __half2float(src[c]) - mean;
+        var += d * d;
+    }
+    var /= (float)C;
+    float inv = rsqrtf(var + eps);
+    for (int c = 0; c < C; ++c) {
+        float v = (__half2float(src[c]) - mean) * inv;
+        if (gamma) v = v * gamma[c] + beta[c];
+        dst[c] = __float2half(v);
+    }
+}
+
+__global__ void kLayerNormModulateHalf(
+    const __half* x, const float* mod_full, const float* shift_tbl, __half* y,
+    int B, int L, int C, int shift_chunk_idx, int scale_chunk_idx, float eps)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= B * L) return;
+    int b = row / L;
+    const __half* src = x + (size_t)row * C;
+    __half* dst = y + (size_t)row * C;
+    float mean = 0.f;
+    for (int c = 0; c < C; ++c) mean += __half2float(src[c]);
+    mean /= (float)C;
+    float var = 0.f;
+    for (int c = 0; c < C; ++c) {
+        float d = __half2float(src[c]) - mean;
+        var += d * d;
+    }
+    var /= (float)C;
+    float inv = rsqrtf(var + eps);
+    const float* mod_b = mod_full + (size_t)b * 6 * C;
+    const float* shift_ptr = mod_b + shift_chunk_idx * C;
+    const float* scale_ptr = mod_b + scale_chunk_idx * C;
+    const float* tbl_shift = shift_tbl + shift_chunk_idx * C;
+    const float* tbl_scale = shift_tbl + scale_chunk_idx * C;
+    for (int c = 0; c < C; ++c) {
+        float sft = shift_ptr[c] + tbl_shift[c];
+        float scl = scale_ptr[c] + tbl_scale[c];
+        dst[c] = __float2half(((__half2float(src[c]) - mean) * inv) * (1.f + scl) + sft);
+    }
+}
+
+// 4. RePo3DRotaryEmbedding Angles Kernel
+// delta_pos: [B, L, H, 3] -> cos_sin: [B, L, H, D/2, 2]
+__global__ void kRePoAngles(
+    const float* delta_pos, // [B*L, H, 3]
+    const float* freqs_0,   // [d0/2]
+    const float* freqs_1,   // [d1/2]
+    const float* freqs_2,   // [d2/2]
+    float* rope_cos_sin,    // [B*L, H, D/2, 2]
+    int BL, int H, int half_D,
+    int half_d0, int half_d1, int half_d2
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = BL * H * half_D;
+    if (idx >= total) return;
+
+    int k = idx % half_D;
+    int bh = idx / half_D;
+
+    const float* dp = delta_pos + (size_t)bh * 3;
+    float ang = 0.0f;
+    const float kPi = 3.14159265358979323846f;
+
+    // clamp_mul(x, f) = x * tanh(f) + x * (f - tanh(f)) = x * f in forward pass!
+    if (k < half_d0) {
+        ang = dp[0] * freqs_0[k] * kPi;
+    } else if (k < half_d0 + half_d1) {
+        ang = dp[1] * freqs_1[k - half_d0] * kPi;
+    } else {
+        ang = dp[2] * freqs_2[k - half_d0 - half_d1] * kPi;
+    }
+
+    rope_cos_sin[(size_t)idx * 2 + 0] = cosf(ang);
+    rope_cos_sin[(size_t)idx * 2 + 1] = sinf(ang);
+}
+
+// 5. Split QKV + Apply RoPE + MultiHeadRMSNorm (for Q and K)
+// qkv: [B, L, 3, H, D]
+// rope_cos_sin: [B, L, H, D/2, 2]
+// q_gamma, k_gamma: [H, D]
+// Outputs q, k, v in layout [B, H, L, D] for optimal Attention memory coalescing!
+__global__ void kPrepQKVWithRoPEAndRMSNorm(
+    const float* qkv,          // [B, L, 3, H, D]
+    const float* rope_cos_sin, // [B, L, H, D/2, 2]
+    const float* q_gamma,      // [H, D]
+    const float* k_gamma,      // [H, D]
+    float* q_out,              // [B, H, L, D]
+    float* k_out,              // [B, H, L, D]
+    float* v_out,              // [B, H, L, D]
+    int B, int L, int H, int D
+) {
+    int bh_l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bh_l >= B * L * H) return;
+
+    int h = bh_l % H;
+    int bl = bh_l / H;
+    int b = bl / L;
+    int l = bl % L;
+
+    const float* q_in = qkv + ((size_t)bl * 3 * H + 0 * H + h) * D;
+    const float* k_in = qkv + ((size_t)bl * 3 * H + 1 * H + h) * D;
+    const float* v_in = qkv + ((size_t)bl * 3 * H + 2 * H + h) * D;
+    const float* cs   = rope_cos_sin + (size_t)bh_l * D; // D = (D/2)*2
+
+    float q_rot[128]; // D = 64 (safe up to 128)
+    float k_rot[128];
+
+    int half_D = D / 2;
+    float q_sq = 0.0f;
+    float k_sq = 0.0f;
+
+    for (int i = 0; i < half_D; ++i) {
+        float c = cs[i * 2 + 0];
+        float s = cs[i * 2 + 1];
+
+        float q0 = q_in[i * 2 + 0], q1 = q_in[i * 2 + 1];
+        float qr0 = q0 * c - q1 * s;
+        float qr1 = q0 * s + q1 * c;
+        q_rot[i * 2 + 0] = qr0;
+        q_rot[i * 2 + 1] = qr1;
+        q_sq += qr0 * qr0 + qr1 * qr1;
+
+        float k0 = k_in[i * 2 + 0], k1 = k_in[i * 2 + 1];
+        float kr0 = k0 * c - k1 * s;
+        float kr1 = k0 * s + k1 * c;
+        k_rot[i * 2 + 0] = kr0;
+        k_rot[i * 2 + 1] = kr1;
+        k_sq += kr0 * kr0 + kr1 * kr1;
+    }
+
+    // MultiHeadRMSNorm: F.normalize(x, dim=-1) * gamma * sqrt(D)
+    // Note: F.normalize divides by max(l2_norm, 1e-12), then multiplies by sqrt(D) == rsqrt(mean_sq)
+    float scale = sqrtf((float)D);
+    float q_inv = rsqrtf(fmaxf(q_sq, 1e-24f)) * scale;
+    float k_inv = rsqrtf(fmaxf(k_sq, 1e-24f)) * scale;
+
+    size_t dst_offset = (((size_t)b * H + h) * L + l) * D;
+    float* q_dst = q_out + dst_offset;
+    float* k_dst = k_out + dst_offset;
+    float* v_dst = v_out + dst_offset;
+
+    const float* qg = q_gamma + (size_t)h * D;
+    const float* kg = k_gamma + (size_t)h * D;
+
+    for (int d = 0; d < D; ++d) {
+        q_dst[d] = q_rot[d] * q_inv * qg[d];
+        k_dst[d] = k_rot[d] * k_inv * kg[d];
+        v_dst[d] = v_in[d];
+    }
+}
+
+
+// Half in / half out PrepQKV — avoids float cast around attention
+__global__ void kPrepQKVHalf(
+    const __half* qkv,         // [B, L, 3, H, D]
+    const float* rope_cos_sin, // [B, L, H, D/2, 2]
+    const float* q_gamma,
+    const float* k_gamma,
+    __half* q_out,             // [B, H, L, D]
+    __half* k_out,
+    __half* v_out,
+    int B, int L, int H, int D
+) {
+    int bh_l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bh_l >= B * L * H) return;
+    int h = bh_l % H;
+    int bl = bh_l / H;
+    int b = bl / L;
+    int l = bl % L;
+
+    const __half* q_in = qkv + ((size_t)bl * 3 * H + 0 * H + h) * D;
+    const __half* k_in = qkv + ((size_t)bl * 3 * H + 1 * H + h) * D;
+    const __half* v_in = qkv + ((size_t)bl * 3 * H + 2 * H + h) * D;
+    const float* cs = rope_cos_sin + (size_t)bh_l * D;
+
+    float q_rot[128], k_rot[128];
+    int half_D = D / 2;
+    float q_sq = 0.f, k_sq = 0.f;
+    for (int i = 0; i < half_D; ++i) {
+        float c = cs[i * 2 + 0], s = cs[i * 2 + 1];
+        float q0 = __half2float(q_in[i * 2 + 0]), q1 = __half2float(q_in[i * 2 + 1]);
+        float qr0 = q0 * c - q1 * s, qr1 = q0 * s + q1 * c;
+        q_rot[i * 2] = qr0; q_rot[i * 2 + 1] = qr1;
+        q_sq += qr0 * qr0 + qr1 * qr1;
+        float k0 = __half2float(k_in[i * 2 + 0]), k1 = __half2float(k_in[i * 2 + 1]);
+        float kr0 = k0 * c - k1 * s, kr1 = k0 * s + k1 * c;
+        k_rot[i * 2] = kr0; k_rot[i * 2 + 1] = kr1;
+        k_sq += kr0 * kr0 + kr1 * kr1;
+    }
+    float scale = sqrtf((float)D);
+    float q_inv = rsqrtf(fmaxf(q_sq, 1e-24f)) * scale;
+    float k_inv = rsqrtf(fmaxf(k_sq, 1e-24f)) * scale;
+    size_t dst = (((size_t)b * H + h) * L + l) * D;
+    const float* qg = q_gamma + (size_t)h * D;
+    const float* kg = k_gamma + (size_t)h * D;
+    for (int d = 0; d < D; ++d) {
+        q_out[dst + d] = __float2half(q_rot[d] * q_inv * qg[d]);
+        k_out[dst + d] = __float2half(k_rot[d] * k_inv * kg[d]);
+        v_out[dst + d] = v_in[d];
+    }
+}
+
+// 6. Best pure-CUDA Flash Attention (fallback when cuDNN SDPA unavailable)
+// float tiles, BLOCK_M=64, BLOCK_N=64 — measured ~4.2s joint_blocks
+template<int D, int BLOCK_M, int BLOCK_N>
+__global__ void kFlashAttentionForward(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int B, int H, int L)
+{
+    const int bh     = blockIdx.y;
+    const int b      = bh / H;
+    const int h      = bh % H;
+    const int q_base = blockIdx.x * BLOCK_M;
+    const int tid    = threadIdx.x;
+    const int q_idx  = q_base + tid;
+
+    __shared__ float sK[BLOCK_N][D + 1];
+    __shared__ float sV[BLOCK_N][D + 1];
+
+    float q_reg[D];
+    float acc_o[D];
+    float m_i = -1e30f;
+    float l_i = 0.f;
+    const float sm_scale = rsqrtf((float)D);
+
+    if (q_idx < L) {
+        const float* q_ptr = Q + (((size_t)b * H + h) * L + q_idx) * D;
+        #pragma unroll
+        for (int d = 0; d < D; d += 4) {
+            float4 v = *reinterpret_cast<const float4*>(q_ptr + d);
+            q_reg[d+0] = v.x * sm_scale;
+            q_reg[d+1] = v.y * sm_scale;
+            q_reg[d+2] = v.z * sm_scale;
+            q_reg[d+3] = v.w * sm_scale;
+            acc_o[d+0] = acc_o[d+1] = acc_o[d+2] = acc_o[d+3] = 0.f;
+        }
+    }
+
+    for (int k_start = 0; k_start < L; k_start += BLOCK_N) {
+        if (tid < BLOCK_N) {
+            int k_pos = k_start + tid;
+            if (k_pos < L) {
+                const float* k_ptr = K + (((size_t)b * H + h) * L + k_pos) * D;
+                const float* v_ptr = V + (((size_t)b * H + h) * L + k_pos) * D;
+                #pragma unroll
+                for (int d = 0; d < D; d += 4) {
+                    float4 kv = *reinterpret_cast<const float4*>(k_ptr + d);
+                    float4 vv = *reinterpret_cast<const float4*>(v_ptr + d);
+                    sK[tid][d+0] = kv.x; sK[tid][d+1] = kv.y;
+                    sK[tid][d+2] = kv.z; sK[tid][d+3] = kv.w;
+                    sV[tid][d+0] = vv.x; sV[tid][d+1] = vv.y;
+                    sV[tid][d+2] = vv.z; sV[tid][d+3] = vv.w;
+                }
+            } else {
+                #pragma unroll
+                for (int d = 0; d < D; ++d) {
+                    sK[tid][d] = 0.f;
+                    sV[tid][d] = 0.f;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (q_idx < L) {
+            int tile_end = min(BLOCK_N, L - k_start);
+            for (int j = 0; j < tile_end; ++j) {
+                float score = 0.f;
+                #pragma unroll
+                for (int d = 0; d < D; d += 4) {
+                    score += q_reg[d+0]*sK[j][d+0] + q_reg[d+1]*sK[j][d+1]
+                           + q_reg[d+2]*sK[j][d+2] + q_reg[d+3]*sK[j][d+3];
+                }
+                float m_prev = m_i;
+                m_i = fmaxf(m_prev, score);
+                float alpha = expf(m_prev - m_i);
+                float p     = expf(score - m_i);
+                l_i = l_i * alpha + p;
+                #pragma unroll
+                for (int d = 0; d < D; d += 4) {
+                    acc_o[d+0] = acc_o[d+0]*alpha + p*sV[j][d+0];
+                    acc_o[d+1] = acc_o[d+1]*alpha + p*sV[j][d+1];
+                    acc_o[d+2] = acc_o[d+2]*alpha + p*sV[j][d+2];
+                    acc_o[d+3] = acc_o[d+3]*alpha + p*sV[j][d+3];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (q_idx < L) {
+        float inv_l = 1.f / l_i;
+        float* o_ptr = O + (((size_t)b * L + q_idx) * H + h) * D;
+        #pragma unroll
+        for (int d = 0; d < D; d += 4) {
+            float4 o;
+            o.x = acc_o[d+0]*inv_l; o.y = acc_o[d+1]*inv_l;
+            o.z = acc_o[d+2]*inv_l; o.w = acc_o[d+3]*inv_l;
+            *reinterpret_cast<float4*>(o_ptr + d) = o;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cuDNN 9.x + cudnn_frontend SDPA
+// Q/K/V/O layout: [B, H, L, D] float, stride {H*L*D, L*D, D, 1}
+//
+// Setup (CUDA 12.8 + cuDNN 9.28):
+//   git clone --depth 1 https://github.com/NVIDIA/cudnn-frontend.git
+//   export CUDNN_FRONTEND_PATH=$PWD/cudnn-frontend
+// Compile:
+//   -DIDOL_USE_CUDNN_FRONTEND -I${CUDNN_FRONTEND_PATH}/include -lcudnn
+// ---------------------------------------------------------------------------
+static bool try_cudnn_sdpa(
+    cudnnHandle_t cudnn,
+    const void* Q, const void* K, const void* V,
+    void* O,
+    int B, int H, int L, int D,
+    cudaStream_t stream,
+    bool io_half /* true: Q/K/V/O are __half* */)
+{
+#if !defined(IDOL_USE_CUDNN_FRONTEND)
+    (void)cudnn; (void)Q; (void)K; (void)V; (void)O;
+    (void)B; (void)H; (void)L; (void)D; (void)stream; (void)io_half;
+    return false;
+#else
+    try {
+        namespace fe = cudnn_frontend;
+
+        // Rebuild plan only when shape changes (B/H/L/D)
+        struct PlanCache {
+            int B = -1, H = -1, L = -1, D = -1;
+            std::shared_ptr<fe::graph::Graph> graph;
+            int64_t workspace_size = 0;
+            void* workspace = nullptr;
+            bool ready = false;
+        };
+        static PlanCache cache;
+
+        const bool shape_changed =
+            (cache.B != B || cache.H != H || cache.L != L || cache.D != D);
+
+        if (shape_changed || !cache.ready) {
+            if (cache.workspace) {
+                cudaFree(cache.workspace);
+                cache.workspace = nullptr;
+            }
+            cache.ready = false;
+            cache.B = B; cache.H = H; cache.L = L; cache.D = D;
+
+            auto graph = std::make_shared<fe::graph::Graph>();
+            // FP16 IO + FP16 intermediate; accumulate in FP32 for stability
+            graph->set_io_data_type(fe::DataType_t::HALF)
+                 .set_intermediate_data_type(fe::DataType_t::HALF)
+                 .set_compute_data_type(fe::DataType_t::FLOAT);
+
+            // Q,K,V memory layout: [B, H, L, D]
+            const std::vector<int64_t> qkv_dims = {B, H, L, D};
+            const std::vector<int64_t> qkv_strides = {
+                (int64_t)H * L * D,
+                (int64_t)L * D,
+                (int64_t)D,
+                1
+            };
+            // O physical [B, L, H, D] viewed as logical [B, H, L, D]
+            const std::vector<int64_t> o_dims = {B, H, L, D};
+            const std::vector<int64_t> o_strides = {
+                (int64_t)L * H * D,
+                (int64_t)D,
+                (int64_t)H * D,
+                1
+            };
+
+            auto q = graph->tensor(fe::graph::Tensor_attributes()
+                .set_name("Q")
+                .set_dim(qkv_dims)
+                .set_stride(qkv_strides)
+                .set_data_type(fe::DataType_t::HALF));
+            auto k = graph->tensor(fe::graph::Tensor_attributes()
+                .set_name("K")
+                .set_dim(qkv_dims)
+                .set_stride(qkv_strides)
+                .set_data_type(fe::DataType_t::HALF));
+            auto v = graph->tensor(fe::graph::Tensor_attributes()
+                .set_name("V")
+                .set_dim(qkv_dims)
+                .set_stride(qkv_strides)
+                .set_data_type(fe::DataType_t::HALF));
+
+            auto sdpa_opts = fe::graph::SDPA_attributes()
+                .set_name("sdpa")
+                .set_causal_mask(false)
+                .set_attn_scale(1.0f / sqrtf((float)D));
+
+            auto [o, stats] = graph->sdpa(q, k, v, sdpa_opts);
+            (void)stats;
+            o->set_output(true)
+              .set_dim(o_dims)
+              .set_stride(o_strides)
+              .set_data_type(fe::DataType_t::HALF);
+
+            // Assign UIDs for variant pack
+            q->set_uid(1);
+            k->set_uid(2);
+            v->set_uid(3);
+            o->set_uid(4);
+
+            if (!graph->validate().is_good()) return false;
+            if (!graph->build_operation_graph(cudnn).is_good()) return false;
+            if (!graph->create_execution_plans({fe::HeurMode_t::A}).is_good()) return false;
+            if (!graph->check_support(cudnn).is_good()) return false;
+            if (!graph->build_plans(cudnn).is_good()) return false;
+
+            cache.workspace_size = graph->get_workspace_size();
+            if (cache.workspace_size > 0) {
+                if (cudaMalloc(&cache.workspace, (size_t)cache.workspace_size) != cudaSuccess)
+                    return false;
+            }
+            cache.graph = graph;
+            cache.ready = true;
+        }
+
+        if (!cache.ready || !cache.graph) return false;
+
+        const size_t need = (size_t)B * H * L * D;
+        __half *hq, *hk, *hv, *ho;
+        // optional owned buffers when inputs are float
+        struct HalfBufs {
+            __half *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
+            size_t n = 0;
+        };
+        static HalfBufs hb;
+
+        if (io_half) {
+            hq = (__half*)Q; hk = (__half*)K; hv = (__half*)V; ho = (__half*)O;
+        } else {
+            if (hb.n < need) {
+                if (hb.q) { cudaFree(hb.q); cudaFree(hb.k); cudaFree(hb.v); cudaFree(hb.o); }
+                if (cudaMalloc(&hb.q, need * sizeof(__half)) != cudaSuccess) return false;
+                if (cudaMalloc(&hb.k, need * sizeof(__half)) != cudaSuccess) return false;
+                if (cudaMalloc(&hb.v, need * sizeof(__half)) != cudaSuccess) return false;
+                if (cudaMalloc(&hb.o, need * sizeof(__half)) != cudaSuccess) return false;
+                hb.n = need;
+            }
+            int threads = 256;
+            int bl = cast_blocks((int)need, threads);
+            kFloatToHalf<<<bl, threads, 0, stream>>>((const float*)Q, hb.q, (int)need);
+            kFloatToHalf<<<bl, threads, 0, stream>>>((const float*)K, hb.k, (int)need);
+            kFloatToHalf<<<bl, threads, 0, stream>>>((const float*)V, hb.v, (int)need);
+            hq = hb.q; hk = hb.k; hv = hb.v; ho = hb.o;
+        }
+
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> variant_pack = {
+            {1, hq}, {2, hk}, {3, hv}, {4, ho},
+        };
+
+        auto st = cache.graph->execute(cudnn, variant_pack, cache.workspace);
+        if (!st.is_good()) {
+            fprintf(stderr, "[IdolDenoiser] cuDNN SDPA execute failed\n");
+            return false;
+        }
+
+        if (!io_half) {
+            int threads = 256;
+            int bl = cast_blocks((int)need, threads);
+            kHalfToFloat<<<bl, threads, 0, stream>>>(ho, (float*)O, (int)need);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[IdolDenoiser] cuDNN SDPA exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        fprintf(stderr, "[IdolDenoiser] cuDNN SDPA unknown exception\n");
+        return false;
+    }
+#endif
+}
+
+// 7. Concat [h_x (B, Lx, C), h_cond (B, Lc, C), h_cam (B, 1, C)] -> h (B, Lx+Lc+1, C)
+__global__ void kConcatStreams(
+    const float* h_x,
+    const float* h_cond,
+    const float* h_cam,
+    float* h_out,
+    int B, int Lx, int Lc, int C
+) {
+    int Ltot = Lx + Lc + 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * Ltot * C;
+    if (idx >= total) return;
+
+    int c = idx % C;
+    int bl = idx / C;
+    int b = bl / Ltot;
+    int l = bl % Ltot;
+
+    if (l < Lx) {
+        h_out[idx] = h_x[((size_t)b * Lx + l) * C + c];
+    } else if (l < Lx + Lc) {
+        h_out[idx] = h_cond[((size_t)b * Lc + (l - Lx)) * C + c];
+    } else {
+        h_out[idx] = h_cam[(size_t)b * C + c];
+    }
+}
+
+// 8. Final Slice + LayerNorm + shift_table modulation
+// Slices first Lx tokens to out_x [B, Lx, C] and last 1 token to out_cam [B, 1, C]
+__global__ void kFinalSliceNormModulate(
+    const float* h,         // [B, Ltot, C]
+    const float* shift_tbl, // [1, 2, C] -> [shift (C), scale (C)]
+    const float* t_emb,     // [B, C]
+    float* out_x,           // [B, Lx, C]
+    float* out_cam,         // [B, 1, C]
+    int B, int Ltot, int Lx, int C
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_rows = B * (Lx + 1);
+    if (row >= total_rows) return;
+
+    int b = row / (Lx + 1);
+    int local_r = row % (Lx + 1);
+    bool is_cam = (local_r == Lx);
+
+    int src_l = is_cam ? (Ltot - 1) : local_r;
+    const float* src = h + ((size_t)b * Ltot + src_l) * C;
+    float* dst = is_cam ? (out_cam + (size_t)b * C) : (out_x + ((size_t)b * Lx + local_r) * C);
+
+    float mean = 0.0f;
+    for (int c = 0; c < C; ++c) mean += src[c];
+    mean /= (float)C;
+
+    float var = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        float d = src[c] - mean;
+        var += d * d;
+    }
+    var /= (float)C;
+    float inv = rsqrtf(var + 1e-5f);
+
+    const float* te = t_emb + (size_t)b * C;
+    for (int c = 0; c < C; ++c) {
+        float sft = shift_tbl[0 * C + c] + te[c];
+        float scl = shift_tbl[1 * C + c] + te[c];
+        dst[c] = ((src[c] - mean) * inv) * (1.0f + scl) + sft;
+    }
+}
+
+} // namespace idol_kernel
+
+// ============================================================
+// C. Plugin Implementation
+// ============================================================
+bool idol_denoiser_plugin::loadWeights(const std::string& path) {
+    freeDeviceWeights();
+    mWeights.clear();
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "\033[31m[IdolDenoiser] cannot open %s\033[0m\n", path.c_str());
+        return false;
+    }
+
+    char magic[8];
+    f.read(magic, 8);
+    if (f.gcount() != 8 || std::memcmp(magic, "IDOLDIT1", 8) != 0) {
+        fprintf(stderr, "\033[31m[IdolDenoiser] invalid weight file magic\033[0m\n");
+        return false;
+    }
+
+    uint32_t cfg_u[10];
+    f.read((char*)cfg_u, sizeof(cfg_u));
+    float mlp_ratio = 4.0f;
+    f.read((char*)&mlp_ratio, sizeof(float));
+
+    mCfg.q_token_length     = (int)cfg_u[0];
+    mCfg.in_channels        = (int)cfg_u[1];
+    mCfg.cam_channels       = (int)cfg_u[2];
+    mCfg.model_channels     = (int)cfg_u[3];
+    mCfg.cond_channels      = (int)cfg_u[4];
+    mCfg.cond2_channels     = (int)cfg_u[5];
+    mCfg.num_blocks         = (int)cfg_u[6];
+    mCfg.num_refiner_blocks = (int)cfg_u[7];
+    mCfg.num_heads          = (int)cfg_u[8];
+    mCfg.num_head_channels  = (int)cfg_u[9];
+    mCfg.mlp_ratio          = mlp_ratio;
+
+    uint32_t num_tensors = 0;
+    f.read((char*)&num_tensors, 4);
+
+    for (uint32_t i = 0; i < num_tensors; ++i) {
+        uint32_t nl = 0, nd = 0;
+        f.read((char*)&nl, 4);
+        std::string name(nl, '\0');
+        f.read(name.data(), nl);
+        f.read((char*)&nd, 4);
+
+        std::vector<int64_t> sh(nd);
+        for (uint32_t d = 0; d < nd; ++d) {
+            uint64_t z = 0;
+            f.read((char*)&z, 8);
+            sh[d] = (int64_t)z;
+        }
+        uint64_t numel = 0;
+        f.read((char*)&numel, 8);
+
+        IdolTensor t;
+        t.name = name;
+        t.shape = sh;
+        t.host.resize(numel);
+        f.read((char*)t.host.data(), numel * sizeof(float));
+        if (!f) return false;
+
+        if (cudaMalloc(&t.device, numel * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMemcpy(t.device, t.host.data(), numel * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+
+        mWeights.emplace(name, std::move(t));
+    }
+
+    fprintf(stderr, "\033[42m[IdolDenoiser] loaded %d tensors (blocks=%d, refiner=%d, C=%d) from %s\033[0m\n",
+            (int)mWeights.size(), mCfg.num_blocks, mCfg.num_refiner_blocks, mCfg.model_channels, path.c_str());
+    mWeightsLoaded = true;
+    return true;
+}
+
+void idol_denoiser_plugin::freeDeviceWeights() {
+    for (auto& kv : mWeights) {
+        if (kv.second.device) {
+            cudaFree(kv.second.device);
+            kv.second.device = nullptr;
+        }
+    }
+    mWeightsLoaded = false;
+}
+
+float* idol_denoiser_plugin::weight(const std::string& name) const {
+    auto it = mWeights.find(name);
+    if (it != mWeights.end()) return it->second.device;
+    fprintf(stderr, "\033[31m[IdolDenoiser] missing weight: %s\033[0m\n", name.c_str());
+    return nullptr;
+}
+
+idol_denoiser_plugin::idol_denoiser_plugin() {
+    mWeightsLoaded = loadWeights(mWeightPath);
+}
+idol_denoiser_plugin::idol_denoiser_plugin(const void* data, size_t len) {
+    if (data && len >= sizeof(uint32_t)) {
+        const uint8_t* p = (const uint8_t*)data;
+        uint32_t n = 0;
+        std::memcpy(&n, p, 4);
+        if (4 + n <= len) mWeightPath.assign((const char*)p + 4, n);
+    }
+    mWeightsLoaded = loadWeights(mWeightPath);
+}
+idol_denoiser_plugin::~idol_denoiser_plugin() {
+    freeDeviceWeights();
+}
+
+int idol_denoiser_plugin::initialize() noexcept {
+    if (!mWeightsLoaded) mWeightsLoaded = loadWeights(mWeightPath);
+    return mWeightsLoaded ? 0 : -1;
+}
+void idol_denoiser_plugin::terminate() noexcept {}
+
+size_t idol_denoiser_plugin::getSerializationSize() const noexcept {
+    return sizeof(uint32_t) + mWeightPath.size();
+}
+void idol_denoiser_plugin::serialize(void* b) const noexcept {
+    uint32_t n = (uint32_t)mWeightPath.size();
+    std::memcpy(b, &n, 4);
+    std::memcpy((uint8_t*)b + 4, mWeightPath.data(), n);
+}
+
+DataType idol_denoiser_plugin::getOutputDataType(int, const DataType*, int) const noexcept {
+    return DataType::kFLOAT;
+}
+
+IPluginV2DynamicExt* idol_denoiser_plugin::clone() const noexcept {
+    auto* p = new idol_denoiser_plugin();
+    p->mWeightPath = mWeightPath;
+    p->mNamespace = mNamespace;
+    return p;
+}
+
+// Inputs: [0] camera [B,1,5], [1] latent [B,8192,16], [2] tt [B], [3] feature1 [B,Lc,1280], [4] feature2 [B,Lc,128]
+// Outputs: [0] out_camera [B,1,5], [1] out_latent [B,8192,16]
+DimsExprs idol_denoiser_plugin::getOutputDimensions(int outputIndex, const DimsExprs* in, int, IExprBuilder& eb) noexcept {
+    DimsExprs o;
+    o.nbDims = 3;
+    o.d[0] = in[0].d[0]; // B
+    if (outputIndex == 0) {
+        o.d[1] = eb.constant(1);
+        o.d[2] = eb.constant(mCfg.cam_channels);
+    } else {
+        o.d[1] = eb.constant(mCfg.q_token_length);
+        o.d[2] = eb.constant(mCfg.in_channels);
+    }
+    return o;
+}
+
+bool idol_denoiser_plugin::supportsFormatCombination(int pos, const PluginTensorDesc* io, int, int) noexcept {
+    return io[pos].type == DataType::kFLOAT && io[pos].format == TensorFormat::kLINEAR;
+}
+
+void idol_denoiser_plugin::configurePlugin(const DynamicPluginTensorDesc* in, int, const DynamicPluginTensorDesc*, int) noexcept {
+    mB = in[0].desc.dims.d[0];
+    mLc = in[3].desc.dims.d[1];
+}
+
+size_t idol_denoiser_plugin::getWorkspaceSize(const PluginTensorDesc*, int, const PluginTensorDesc*, int) const noexcept {
+    return 0;
+}
+
+int idol_denoiser_plugin::enqueue(
+    const PluginTensorDesc*,
+    const PluginTensorDesc*,
+    const void* const* inputs,
+    void* const* outputs,
+    void*,
+    cudaStream_t stream
+) noexcept {
+    if (!mWeightsLoaded) return -1;
+    return run_denoiser(
+        static_cast<const float*>(inputs[0]),
+        static_cast<const float*>(inputs[1]),
+        static_cast<const float*>(inputs[2]),
+        static_cast<const float*>(inputs[3]),
+        static_cast<const float*>(inputs[4]),
+        static_cast<float*>(outputs[0]),
+        static_cast<float*>(outputs[1]),
+        stream
+    );
+}
+
+// ============================================================
+// D. Core Denoiser Forward Execution
+// ============================================================
+int idol_denoiser_plugin::run_denoiser(
+    const float* camera,
+    const float* latent,
+    const float* t,
+    const float* feature1,
+    const float* feature2,
+    float* out_camera,
+    float* out_latent,
+    cudaStream_t stream
+) {
+    uint64_t tm1 = gtm();
+    using namespace idol_kernel;
+
+    const int B    = mB;
+    const int Lx   = mCfg.q_token_length;   // 8192
+    const int Lc   = mLc;                   // 4101
+    const int Lcam = 1;
+    const int Ltot = Lx + Lc + Lcam;        // 12294
+    const int C    = mCfg.model_channels;   // 1024
+    const int H    = mCfg.num_heads;        // 16
+    const int D    = mCfg.num_head_channels;// 64
+    const int mlp_hidden = (int)(C * mCfg.mlp_ratio); // 4096
+    const int repo_hidden = (int)(C * 0.125f);        // 128
+
+    if (B <= 0 || Lc <= 0 || D != 64) {
+        fprintf(stderr, "\033[31m[IdolDenoiser] invalid dimensions B=%d, Lc=%d, D=%d\033[0m\n", B, Lc, D);
+        return -1;
+    }
+
+    DeviceArena arena;
+    cublasHandle_t handle = nullptr;
+    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) return -1;
+    if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(handle);
+        return -1;
+    }
+    // 开启 TF32 加速矩阵乘法 (Ampere+ GPU 性能翻倍)
+    // Prefer Tensor Core FP16 GEMMs
+    cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+
+    // Lazy FP16 weight cache (device)
+    static std::unordered_map<std::string, __half*> s_half_w;
+    auto get_half_weight = [&](const std::string& name, int n_elem) -> __half* {
+        auto it = s_half_w.find(name);
+        if (it != s_half_w.end()) return it->second;
+        const float* w_f = weight(name);
+        if (!w_f) return nullptr;
+        __half* w_h = nullptr;
+        if (cudaMalloc(&w_h, (size_t)n_elem * sizeof(__half)) != cudaSuccess) return nullptr;
+        int threads = 256;
+        int bl = (n_elem + threads - 1) / threads;
+        // default stream ok for one-time convert; follow compute stream for safety
+        kFloatToHalf<<<cast_blocks(n_elem, threads), threads, 0, stream>>>(w_f, w_h, n_elem);
+        // no full sync — subsequent GEMM is on same stream
+        s_half_w[name] = w_h;
+        return w_h;
+    };
+
+    // Scratch half buffers for GEMM (grow once)
+    static __half* s_x_h = nullptr;
+    static __half* s_y_h = nullptr;
+    static size_t s_xy_cap = 0;
+    auto ensure_xy = [&](size_t n) -> bool {
+        if (s_xy_cap >= n) return true;
+        if (s_x_h) { cudaFree(s_x_h); cudaFree(s_y_h); }
+        if (cudaMalloc(&s_x_h, n * sizeof(__half)) != cudaSuccess) return false;
+        if (cudaMalloc(&s_y_h, n * sizeof(__half)) != cudaSuccess) return false;
+        s_xy_cap = n;
+        return true;
+    };
+
+    // Linear: Y = X * W^T + b   via FP16 Tensor Core GEMM
+    auto linear = [&](
+        const float* x, int rows, int Cin, int Cout,
+        const std::string& w_name, const std::string& b_name,
+        float* out
+    ) -> bool {
+        __half* w_h = get_half_weight(w_name, Cin * Cout);
+        if (!w_h) return false;
+        if (!ensure_xy(std::max((size_t)rows * Cin, (size_t)rows * Cout))) return false;
+
+        int n_in = rows * Cin;
+        int n_out = rows * Cout;
+        kFloatToHalf<<<cast_blocks(n_in), 256, 0, stream>>>(x, s_x_h, n_in);
+
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            Cout, rows, Cin,
+            &alpha,
+            w_h, CUDA_R_16F, Cin,
+            s_x_h, CUDA_R_16F, Cin,
+            &beta,
+            s_y_h, CUDA_R_16F, Cout,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) return false;
+
+        kHalfToFloat<<<cast_blocks(n_out), 256, 0, stream>>>(s_y_h, out, n_out);
+
+        if (!b_name.empty()) {
+            const float* b = weight(b_name);
+            if (!b) return false;
+            kBias<<<blocks(n_out), 256, 0, stream>>>(out, b, rows, Cout);
+        }
+        return cudaGetLastError() == cudaSuccess;
+    };
+
+    // Half-resident linear: __half* -> __half* (no cast)
+    auto linear_h = [&](
+        const __half* x, int rows, int Cin, int Cout,
+        const std::string& w_name, const std::string& b_name,
+        __half* out
+    ) -> bool {
+        __half* w_h = get_half_weight(w_name, Cin * Cout);
+        if (!w_h) return false;
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            Cout, rows, Cin,
+            &alpha,
+            w_h, CUDA_R_16F, Cin,
+            x, CUDA_R_16F, Cin,
+            &beta,
+            out, CUDA_R_16F, Cout,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) return false;
+        if (!b_name.empty()) {
+            const float* b = weight(b_name);
+            if (!b) return false;
+            kBiasHalf<<<blocks(rows * Cout), 256, 0, stream>>>(out, b, rows, Cout);
+        }
+        return cudaGetLastError() == cudaSuccess;
+    };
+
+    // Pre-allocate reusable ping-pong & workspace buffers in DeviceArena
+    float *h_x = nullptr, *h_cond = nullptr, *h_cond2 = nullptr, *h_cam = nullptr;
+    float *h_joint = nullptr, *buf_norm = nullptr, *buf_qkv = nullptr, *buf_attn_out = nullptr;
+    float *q_buf = nullptr, *k_buf = nullptr, *v_buf = nullptr;
+    float *mlp_mid = nullptr, *mlp_out = nullptr;
+    float *repo_norm = nullptr, *repo_gate = nullptr, *repo_cont = nullptr, *repo_dp = nullptr, *rope_cs = nullptr;
+
+    size_t max_tokens = (size_t)B * Ltot;
+    if (!arena.alloc((size_t)B * Lx * C, &h_x) ||
+        !arena.alloc((size_t)B * Lc * C, &h_cond) ||
+        !arena.alloc((size_t)B * Lc * C, &h_cond2) ||
+        !arena.alloc((size_t)B * Lcam * C, &h_cam) ||
+        !arena.alloc(max_tokens * C, &h_joint) ||
+        !arena.alloc(max_tokens * C, &buf_norm) ||
+        !arena.alloc(max_tokens * 3 * C, &buf_qkv) ||
+        !arena.alloc(max_tokens * C, &buf_attn_out) ||
+        !arena.alloc(max_tokens * C, &q_buf) ||
+        !arena.alloc(max_tokens * C, &k_buf) ||
+        !arena.alloc(max_tokens * C, &v_buf) ||
+        !arena.alloc(max_tokens * mlp_hidden, &mlp_mid) ||
+        !arena.alloc(max_tokens * C, &mlp_out) ||
+        !arena.alloc(max_tokens * C, &repo_norm) ||
+        !arena.alloc(max_tokens * repo_hidden, &repo_gate) ||
+        !arena.alloc(max_tokens * repo_hidden, &repo_cont) ||
+        !arena.alloc(max_tokens * 3 * H, &repo_dp) ||
+        !arena.alloc(max_tokens * H * D, &rope_cs)) {
+        cublasDestroy(handle);
+        return -1;
+    }
+
+    // Half-resident buffers for joint blocks (minimize float↔half casts)
+    __half *h_joint_h = nullptr, *buf_norm_h = nullptr, *buf_qkv_h = nullptr;
+    __half *buf_attn_h = nullptr, *mlp_mid_h = nullptr, *mlp_out_h = nullptr;
+    __half *tmp_h = nullptr;
+    __half *q_h = nullptr, *k_h = nullptr, *v_h = nullptr;
+    if (!arena.alloc(max_tokens * C, &h_joint_h) ||
+        !arena.alloc(max_tokens * C, &buf_norm_h) ||
+        !arena.alloc(max_tokens * 3 * C, &buf_qkv_h) ||
+        !arena.alloc(max_tokens * C, &buf_attn_h) ||
+        !arena.alloc(max_tokens * mlp_hidden, &mlp_mid_h) ||
+        !arena.alloc(max_tokens * C, &mlp_out_h) ||
+        !arena.alloc(max_tokens * C, &tmp_h) ||
+        !arena.alloc(max_tokens * C, &q_h) ||
+        !arena.alloc(max_tokens * C, &k_h) ||
+        !arena.alloc(max_tokens * C, &v_h)) {
+        cublasDestroy(handle);
+        return -1;
+    }
+
+    cudaStreamSynchronize(stream);
+    uint64_t t_alloc = gtm();
+
+    // --------------------------------------------------------
+    // 1. Input Projections & Positional Embedding
+    // --------------------------------------------------------
+    // h_x = input_layer(z) + precomputed_pos_embed
+    if (!linear(latent, B * Lx, mCfg.in_channels, C, "input_layer.weight", "input_layer.bias", h_x)) {
+        cublasDestroy(handle); return -1;
+    }
+    const float* pos_emb = weight("precomputed_pos_embed");
+    if (!pos_emb) { cublasDestroy(handle); return -1; }
+    kAddBroadcastB<<<blocks(B * Lx * C), 256, 0, stream>>>(h_x, pos_emb, h_x, B, Lx, C);
+
+    // h_cond = cond_embedder(feature1) + cond_embedder2(feature2)
+    if (!linear(feature1, B * Lc, mCfg.cond_channels, C, "cond_embedder.weight", "cond_embedder.bias", h_cond) ||
+        !linear(feature2, B * Lc, mCfg.cond2_channels, C, "cond_embedder2.weight", "cond_embedder2.bias", h_cond2)) {
+        cublasDestroy(handle); return -1;
+    }
+    kAdd<<<blocks(B * Lc * C), 256, 0, stream>>>(h_cond, h_cond2, h_cond, B * Lc * C);
+
+    cudaStreamSynchronize(stream);
+    uint64_t t_proj = gtm();
+
+    // --------------------------------------------------------
+    // 2. Timestep Embedder & Shared adaLN_modulation
+    // --------------------------------------------------------
+    float *t_sin = nullptr, *t_mlp0 = nullptr, *t_emb = nullptr, *t_mod = nullptr;
+    if (!arena.alloc((size_t)B * 256, &t_sin) ||
+        !arena.alloc((size_t)B * C, &t_mlp0) ||
+        !arena.alloc((size_t)B * C, &t_emb) ||
+        !arena.alloc((size_t)B * 6 * C, &t_mod)) {
+        cublasDestroy(handle); return -1;
+    }
+    kSinusoidalTimestep<<<blocks(B * 128), 256, 0, stream>>>(t, t_sin, B, 256, 10000.0f);
+    if (!linear(t_sin, B, 256, C, "t_embedder.mlp.0.weight", "t_embedder.mlp.0.bias", t_mlp0)) {
+        cublasDestroy(handle); return -1;
+    }
+    kSiLU<<<blocks(B * C), 256, 0, stream>>>(t_mlp0, t_mlp0, B * C);
+    if (!linear(t_mlp0, B, C, C, "t_embedder.mlp.2.weight", "t_embedder.mlp.2.bias", t_emb)) {
+        cublasDestroy(handle); return -1;
+    }
+    // adaLN_modulation: SiLU(t_emb) -> Linear(C, 6*C)
+    kSiLU<<<blocks(B * C), 256, 0, stream>>>(t_emb, t_mlp0, B * C);
+    if (!linear(t_mlp0, B, C, 6 * C, "adaLN_modulation.1.weight", "adaLN_modulation.1.bias", t_mod)) {
+        cublasDestroy(handle); return -1;
+    }
+
+    cudaStreamSynchronize(stream);
+    uint64_t t_time = gtm();
+
+    // --------------------------------------------------------
+    // Helper: RePo3DRotaryEmbedding + UnifiedTransformerBlock
+    // --------------------------------------------------------
+    int dim_0 = 2 * (D / 6);
+    int dim_1 = dim_0;
+    int dim_2 = D - dim_0 - dim_1;
+    int half_d0 = dim_0 / 2, half_d1 = dim_1 / 2, half_d2 = dim_2 / 2;
+
+    auto run_transformer_block = [&](
+        float* x_stream, int L_seq, bool modulation,
+        const std::string& repo_prefix, const std::string& blk_prefix
+    ) -> bool {
+        int rows = B * L_seq;
+
+        // A. RePo3DRotaryEmbedding(x_stream) -> rope_cs
+        const float* rn_w = weight(repo_prefix + "norm.weight");
+        const float* rn_b = weight(repo_prefix + "norm.bias");
+        const float* f0   = weight(repo_prefix + "freqs_0");
+        const float* f1   = weight(repo_prefix + "freqs_1");
+        const float* f2   = weight(repo_prefix + "freqs_2");
+        if (!rn_w || !rn_b || !f0 || !f1 || !f2) return false;
+
+        kLayerNorm32<<<blocks(rows), 256, 0, stream>>>(x_stream, repo_norm, rn_w, rn_b, rows, C, 1e-5f);
+        if (!linear(repo_norm, rows, C, repo_hidden, repo_prefix + "gate_map.weight", "", repo_gate) ||
+            !linear(repo_norm, rows, C, repo_hidden, repo_prefix + "content_map.weight", "", repo_cont)) {
+            return false;
+        }
+        kSiLUMul<<<blocks(rows * repo_hidden), 256, 0, stream>>>(repo_gate, repo_cont, repo_gate, rows * repo_hidden);
+        if (!linear(repo_gate, rows, repo_hidden, 3 * H, repo_prefix + "final_map.weight", "", repo_dp)) {
+            return false;
+        }
+        kRePoAngles<<<blocks(rows * H * (D / 2)), 256, 0, stream>>>(
+            repo_dp, f0, f1, f2, rope_cs, rows, H, D / 2, half_d0, half_d1, half_d2
+        );
+
+        // B. Norm1 (+ optional adaLN modulation)
+        const float* shift_tbl = nullptr;
+        if (modulation) {
+            shift_tbl = weight(blk_prefix + "shift_table");
+            if (!shift_tbl) return false;
+            kLayerNormModulate<<<blocks(rows), 256, 0, stream>>>(
+                x_stream, t_mod, shift_tbl, buf_norm, B, L_seq, C, 0, 1, 1e-6f
+            );
+        } else {
+            const float* n1_w = weight(blk_prefix + "norm1.weight");
+            const float* n1_b = weight(blk_prefix + "norm1.bias");
+            if (!n1_w || !n1_b) return false;
+            kLayerNorm32<<<blocks(rows), 256, 0, stream>>>(x_stream, buf_norm, n1_w, n1_b, rows, C, 1e-6f);
+        }
+
+        // C. RopeMultiHeadAttention
+        if (!linear(buf_norm, rows, C, 3 * C, blk_prefix + "attn.qkv.weight", blk_prefix + "attn.qkv.bias", buf_qkv)) {
+            return false;
+        }
+        const float* q_g = weight(blk_prefix + "attn.q_norm.gamma");
+        const float* k_g = weight(blk_prefix + "attn.k_norm.gamma");
+        if (!q_g || !k_g) return false;
+
+        kPrepQKVWithRoPEAndRMSNorm<<<blocks(rows * H), 256, 0, stream>>>(
+            buf_qkv, rope_cs, q_g, k_g, q_buf, k_buf, v_buf, B, L_seq, H, D
+        );
+
+        // Prefer cuDNN SDPA when enabled+working; else pure-CUDA FlashAttention
+        static thread_local cudnnHandle_t s_cudnn = nullptr;
+        static thread_local bool s_cudnn_ok = false;
+        if (!s_cudnn) {
+            if (cudnnCreate(&s_cudnn) == CUDNN_STATUS_SUCCESS) {
+                s_cudnn_ok = true;
+            }
+        }
+        bool used_cudnn = false;
+        if (s_cudnn_ok) {
+            cudnnSetStream(s_cudnn, stream);
+            used_cudnn = try_cudnn_sdpa(
+                s_cudnn, q_buf, k_buf, v_buf, buf_attn_out,
+                B, H, L_seq, D, stream, false);
+        }
+        if (!used_cudnn) {
+            // Best measured pure-CUDA path: BLOCK_M=64, BLOCK_N=64, float
+            dim3 grid((L_seq + 63) / 64, B * H);
+            dim3 block(64);
+            kFlashAttentionForward<64, 64, 64><<<grid, block, 0, stream>>>(
+                q_buf, k_buf, v_buf, buf_attn_out, B, H, L_seq);
+        }
+
+        if (!linear(buf_attn_out, rows, C, C, blk_prefix + "attn.out.weight", blk_prefix + "attn.out.bias", mlp_out)) {
+            return false;
+        }
+
+        // Residual 1 (+ optional gate_msa)
+        if (modulation) {
+            kGateResidualAdd<<<blocks(rows * C), 256, 0, stream>>>(x_stream, mlp_out, t_mod, shift_tbl, B, L_seq, C, 2);
+        } else {
+            kAdd<<<blocks(rows * C), 256, 0, stream>>>(x_stream, mlp_out, x_stream, rows * C);
+        }
+
+        // D. Norm2 (+ optional adaLN modulation)
+        if (modulation) {
+            kLayerNormModulate<<<blocks(rows), 256, 0, stream>>>(
+                x_stream, t_mod, shift_tbl, buf_norm, B, L_seq, C, 3, 4, 1e-6f
+            );
+        } else {
+            const float* n2_w = weight(blk_prefix + "norm2.weight");
+            const float* n2_b = weight(blk_prefix + "norm2.bias");
+            if (!n2_w || !n2_b) return false;
+            kLayerNorm32<<<blocks(rows), 256, 0, stream>>>(x_stream, buf_norm, n2_w, n2_b, rows, C, 1e-6f);
+        }
+
+        // E. FeedForwardNet (Linear -> GELU_tanh -> Linear)
+        if (!linear(buf_norm, rows, C, mlp_hidden, blk_prefix + "mlp.mlp.0.weight", blk_prefix + "mlp.mlp.0.bias", mlp_mid)) {
+            return false;
+        }
+        kGELUTanh<<<blocks(rows * mlp_hidden), 256, 0, stream>>>(mlp_mid, mlp_mid, rows * mlp_hidden);
+        if (!linear(mlp_mid, rows, mlp_hidden, C, blk_prefix + "mlp.mlp.2.weight", blk_prefix + "mlp.mlp.2.bias", mlp_out)) {
+            return false;
+        }
+
+        // Residual 2 (+ optional gate_mlp)
+        if (modulation) {
+            kGateResidualAdd<<<blocks(rows * C), 256, 0, stream>>>(x_stream, mlp_out, t_mod, shift_tbl, B, L_seq, C, 5);
+        } else {
+            kAdd<<<blocks(rows * C), 256, 0, stream>>>(x_stream, mlp_out, x_stream, rows * C);
+        }
+
+        return cudaGetLastError() == cudaSuccess;
+    };
+
+    // --------------------------------------------------------
+    // 3. Separate Stream Refiners (noise, context, camera)
+    // --------------------------------------------------------
+    for (int i = 0; i < mCfg.num_refiner_blocks; ++i) {
+        std::string idx = std::to_string(i) + ".";
+        if (!run_transformer_block(h_x, Lx, true, "noise_repo_layers." + idx, "noise_refiner." + idx)) {
+            cublasDestroy(handle); return -1;
+        }
+        if (!run_transformer_block(h_cond, Lc, false, "context_repo_layers." + idx, "context_refiner." + idx)) {
+            cublasDestroy(handle); return -1;
+        }
+    }
+
+    // cam_refiner: MLP(cam_channels, C, C, mlp_layer_num=num_refiner_blocks)
+    {
+        const float* cur_cam = camera;
+        for (int i = 0; i < mCfg.num_refiner_blocks; ++i) {
+            int in_d = (i == 0) ? mCfg.cam_channels : C;
+            std::string lp = "cam_refiner.mlp." + std::to_string(i * 2) + ".";
+            if (!linear(cur_cam, B, in_d, C, lp + "weight", lp + "bias", h_cam)) {
+                cublasDestroy(handle); return -1;
+            }
+            if (i < mCfg.num_refiner_blocks - 1) {
+                kGELUTanh<<<blocks(B * C), 256, 0, stream>>>(h_cam, h_cam, B * C);
+            }
+            cur_cam = h_cam;
+        }
+    }
+
+    cudaStreamSynchronize(stream);
+    uint64_t t_refiner = gtm();
+
+    // --------------------------------------------------------
+    // 4. Concat + Joint Transformer Blocks (half-resident activations)
+    // --------------------------------------------------------
+    kConcatStreams<<<blocks(B * Ltot * C), 256, 0, stream>>>(h_x, h_cond, h_cam, h_joint, B, Lx, Lc, C);
+
+    // Promote joint stream to half once; stay in half across all 24 blocks
+    {
+        int n_joint = B * Ltot * C;
+        kFloatToHalf<<<cast_blocks(n_joint), 256, 0, stream>>>(h_joint, h_joint_h, n_joint);
+    }
+
+    for (int i = 0; i < mCfg.num_blocks; ++i) {
+        std::string idx = std::to_string(i) + ".";
+        std::string repo_prefix = "repo_layers." + idx;
+        std::string blk_prefix  = "blocks." + idx;
+        int L_seq = Ltot;
+        int rows = B * L_seq;
+
+        // --- RePo3D: norm in float, maps in half ---
+        {
+            const float* rn_w = weight(repo_prefix + "norm.weight");
+            const float* rn_b = weight(repo_prefix + "norm.bias");
+            const float* f0 = weight(repo_prefix + "freqs_0");
+            const float* f1 = weight(repo_prefix + "freqs_1");
+            const float* f2 = weight(repo_prefix + "freqs_2");
+            if (!rn_w || !rn_b || !f0 || !f1 || !f2) { cublasDestroy(handle); return -1; }
+
+            kLayerNorm32Half<<<blocks(rows), 256, 0, stream>>>(h_joint_h, buf_norm_h, rn_w, rn_b, rows, C, 1e-5f);
+            // repo maps via half linear into float temps for angles (small)
+            if (!linear_h(buf_norm_h, rows, C, repo_hidden, repo_prefix + "gate_map.weight", "", mlp_mid_h) ||
+                !linear_h(buf_norm_h, rows, C, repo_hidden, repo_prefix + "content_map.weight", "", mlp_out_h)) {
+                cublasDestroy(handle); return -1;
+            }
+            // SiLU*mul in float for stability on small hidden
+            kHalfToFloat<<<cast_blocks(rows * repo_hidden), 256, 0, stream>>>(mlp_mid_h, repo_gate, rows * repo_hidden);
+            kHalfToFloat<<<cast_blocks(rows * repo_hidden), 256, 0, stream>>>(mlp_out_h, repo_cont, rows * repo_hidden);
+
+            kSiLUMul<<<blocks(rows * repo_hidden), 256, 0, stream>>>(repo_gate, repo_cont, repo_gate, rows * repo_hidden);
+            if (!linear(repo_gate, rows, repo_hidden, 3 * H, repo_prefix + "final_map.weight", "", repo_dp)) {
+                cublasDestroy(handle); return -1;
+            }
+            kRePoAngles<<<blocks(rows * H * (D / 2)), 256, 0, stream>>>(
+                repo_dp, f0, f1, f2, rope_cs, rows, H, D / 2, half_d0, half_d1, half_d2);
+        }
+
+        // --- Norm1 + adaLN (float) then stay half ---
+        const float* shift_tbl = weight(blk_prefix + "shift_table");
+        if (!shift_tbl) { cublasDestroy(handle); return -1; }
+        kLayerNormModulateHalf<<<blocks(rows), 256, 0, stream>>>(
+            h_joint_h, t_mod, shift_tbl, buf_norm_h, B, L_seq, C, 0, 1, 1e-6f);
+
+        // QKV + attn out in half
+        if (!linear_h(buf_norm_h, rows, C, 3 * C,
+                      blk_prefix + "attn.qkv.weight", blk_prefix + "attn.qkv.bias", buf_qkv_h)) {
+            cublasDestroy(handle); return -1;
+        }
+        const float* q_g = weight(blk_prefix + "attn.q_norm.gamma");
+        const float* k_g = weight(blk_prefix + "attn.k_norm.gamma");
+        if (!q_g || !k_g) { cublasDestroy(handle); return -1; }
+        // Prep in half → half QKV, feed cuDNN SDPA without casts
+        kPrepQKVHalf<<<blocks(rows * H), 256, 0, stream>>>(
+            buf_qkv_h, rope_cs, q_g, k_g, q_h, k_h, v_h, B, L_seq, H, D);
+
+        static thread_local cudnnHandle_t s_cudnn2 = nullptr;
+        static thread_local bool s_cudnn2_ok = false;
+        if (!s_cudnn2) {
+            if (cudnnCreate(&s_cudnn2) == CUDNN_STATUS_SUCCESS) s_cudnn2_ok = true;
+        }
+        bool used_cudnn = false;
+        if (s_cudnn2_ok) {
+            cudnnSetStream(s_cudnn2, stream);
+            used_cudnn = try_cudnn_sdpa(s_cudnn2, q_h, k_h, v_h, buf_attn_h,
+                                        B, H, L_seq, D, stream, true);
+        }
+        if (!used_cudnn) {
+            // fallback: cast to float FA
+            kHalfToFloat<<<cast_blocks(rows * C), 256, 0, stream>>>(q_h, q_buf, rows * C);
+            kHalfToFloat<<<cast_blocks(rows * C), 256, 0, stream>>>(k_h, k_buf, rows * C);
+            kHalfToFloat<<<cast_blocks(rows * C), 256, 0, stream>>>(v_h, v_buf, rows * C);
+            dim3 grid((L_seq + 63) / 64, B * H);
+            dim3 block(64);
+            kFlashAttentionForward<64, 64, 64><<<grid, block, 0, stream>>>(
+                q_buf, k_buf, v_buf, buf_attn_out, B, H, L_seq);
+            kFloatToHalf<<<cast_blocks(rows * C), 256, 0, stream>>>(buf_attn_out, buf_attn_h, rows * C);
+        }
+
+        if (!linear_h(buf_attn_h, rows, C, C,
+                      blk_prefix + "attn.out.weight", blk_prefix + "attn.out.bias", mlp_out_h)) {
+            cublasDestroy(handle); return -1;
+        }
+        kGateResidualAddHalf<<<blocks(rows * C), 256, 0, stream>>>(
+            h_joint_h, mlp_out_h, t_mod, shift_tbl, B, L_seq, C, 2);
+
+        // Norm2 + MLP in half after float norm
+        kLayerNormModulateHalf<<<blocks(rows), 256, 0, stream>>>(
+            h_joint_h, t_mod, shift_tbl, buf_norm_h, B, L_seq, C, 3, 4, 1e-6f);
+
+        if (!linear_h(buf_norm_h, rows, C, mlp_hidden,
+                      blk_prefix + "mlp.mlp.0.weight", blk_prefix + "mlp.mlp.0.bias", mlp_mid_h)) {
+            cublasDestroy(handle); return -1;
+        }
+        kGELUTanhHalf<<<cast_blocks(rows * mlp_hidden), 256, 0, stream>>>(mlp_mid_h, mlp_mid_h, rows * mlp_hidden);
+        if (!linear_h(mlp_mid_h, rows, mlp_hidden, C,
+                      blk_prefix + "mlp.mlp.2.weight", blk_prefix + "mlp.mlp.2.bias", mlp_out_h)) {
+            cublasDestroy(handle); return -1;
+        }
+        kGateResidualAddHalf<<<blocks(rows * C), 256, 0, stream>>>(
+            h_joint_h, mlp_out_h, t_mod, shift_tbl, B, L_seq, C, 5);
+
+        if (cudaGetLastError() != cudaSuccess) { cublasDestroy(handle); return -1; }
+    }
+
+    // Back to float for final heads
+    kHalfToFloat<<<cast_blocks(B * Ltot * C), 256, 0, stream>>>(h_joint_h, h_joint, B * Ltot * C);
+
+    cudaStreamSynchronize(stream);
+    uint64_t t_joint = gtm();
+
+    // --------------------------------------------------------
+    // 5. Final Slice, LayerNorm, shift_table & Output Heads
+    // --------------------------------------------------------
+    const float* final_shift = weight("shift_table");
+    if (!final_shift) { cublasDestroy(handle); return -1; }
+
+    kFinalSliceNormModulate<<<blocks(B * (Lx + 1)), 256, 0, stream>>>(
+        h_joint, final_shift, t_emb, h_x, h_cam, B, Ltot, Lx, C
+    );
+
+    if (!linear(h_x, B * Lx, C, mCfg.in_channels, "out_layer.weight", "out_layer.bias", out_latent) ||
+        !linear(h_cam, B, C, mCfg.cam_channels, "cam_out_layer.weight", "cam_out_layer.bias", out_camera)) {
+        cublasDestroy(handle); return -1;
+    }
+
+    cudaStreamSynchronize(stream);
+    cublasDestroy(handle);
+    uint64_t tm2 = gtm();
+
+    fprintf(stderr,
+        "\033[42m[IdolDenoiser] SUCCESS total=%lu us\n"
+        "  alloc       : %lu us\n"
+        "  input_proj  : %lu us\n"
+        "  timestep    : %lu us\n"
+        "  refiners    : %lu us\n"
+        "  joint_blocks: %lu us\n"
+        "  final_heads : %lu us\033[0m\n",
+        (tm2 - tm1),
+        (t_alloc - tm1),
+        (t_proj - t_alloc),
+        (t_time - t_proj),
+        (t_refiner - t_time),
+        (t_joint - t_refiner),
+        (tm2 - t_joint));
+    return 0;
+}
+
+
+
+
+
